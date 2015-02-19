@@ -1,0 +1,109 @@
+#!/bin/bash
+
+export MBfifo="$(mktemp -u -t fifo.XXXXXX)"
+
+# From http://stackoverflow.com/questions/3338030/multiple-bash-traps-for-the-same-signal
+# And to call LB_stop on EXIT.
+# appends a command to a trap
+#
+# - 1st arg: code to add
+# - remaining args: names of traps to modify
+#
+function trap_add {
+    local trap_add_cmd="$1"
+    shift || { echo "${FUNCNAME} usage error" >&2 ; return 1 ; }
+    for trap_add_name in "$@"; do
+        trap -- "$(
+        # helper fn to get existing trap command from output of trap -p
+        extract_trap_cmd() { printf '%s\n' "$3"; }
+        # print existing trap command
+        eval "extract_trap_cmd $(trap -p "${trap_add_name}")"
+        # print the new trap command
+        printf '%s' "${trap_add_cmd}"
+        )" "${trap_add_name}" \
+            || { echo "${FUNCNAME} error: unable to add to trap ${trap_add_name}" >&2 ; return 1 ; }
+    done
+}
+# set the trace attribute for the above function. this is
+# required to modify DEBUG or RETURN traps because functions don't
+# inherit them unless the trace attribute is set
+#declare -f -t trap_add
+
+function MB_readoutput {
+	while read -t 2 line ; do
+			[[ ${line} =~ scan_progress: ]] || echo $line
+	done <&6
+}
+export -f MB_readoutput
+
+function MB_aobscan {
+	local tab="$1"
+	shift
+    echo reset >&5
+	echo "option scan_data_type bytearray" >&5
+    echo "$@" >&5
+    #echo "$@" | sed ' s,?,\\?,g ' >&5
+	MB_readoutput >&2
+    echo list >&5
+    while read -t 3 line ; do
+		 echo "$line" >&2
+		[[ ${line:0:4} =~ \[[\ 0-9]+\] ]] &&
+				eval $tab${line:0:4}=$(echo "${line}" | sed -n ' s#.*0x\([0-9a-f]\+\), \([0-9 a-f]\+\).*#"\U\1 \2"#p ')
+    done <&6
+}
+export -f MB_aobscan
+
+function MB_address {
+    [ "$2" ] || set -- $*
+    echo "$1"
+}
+export -f MB_address
+
+function MB_data {
+    [ "$2" ] || set -- $*
+    shift
+    echo "$@"
+}
+export -f MB_data
+
+function MB_writearray {
+    local startaddr="$(echo "obase=16;ibase=16;$1" | bc -l)"
+    local arraydata="${2%%+*}"
+    local offset
+    [[ "$2" =~ \+ ]] && offset=$(( ${2#*+} )) || offset=0
+
+    # if lenght is explicitly set to 0, do nothing.
+    [ "$3" ] && (($3==0)) && return
+
+    local lenght=$(($3))
+
+    if ((lenght)) ; then
+        echo "write bytearray $startaddr ${arraydata:$((offset*3)):$((lenght*3))}" >&5
+    else
+        echo "write bytearray $startaddr ${arraydata:$((offset*3))}" >&5
+    fi
+}
+export -f MB_writearray
+
+function MB_start {
+    mkfifo "${MBfifo}.in"
+    mkfifo "${MBfifo}.out"
+    exec 5<> "${MBfifo}.in"
+    exec 6<> "${MBfifo}.out"
+
+    scanmem --backend -p "$1"  <&5 >&6 &
+    echo >&5
+    MB_readoutput
+}
+export -f MB_start
+
+function MB_stop {
+    echo quit >&5
+    exec 5>&-
+    exec 6>&-
+    rm -v "$MBfifo"*
+}
+export -f MB_stop
+
+trap_add MB_stop EXIT
+
